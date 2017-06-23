@@ -29,195 +29,192 @@
  */
 package com.twitter.chill
 
+import _root_.java.io.IOException
 import _root_.java.lang.reflect.Field
+import _root_.java.io.ByteArrayOutputStream
+import _root_.java.io.ObjectOutputStream
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable.{Set => MSet, Map => MMap}
+import org.apache.xbean.asm7.Opcodes._
+import org.apache.xbean.asm7.{ClassReader, ClassVisitor, MethodVisitor, Type}
 
 import scala.annotation.tailrec
+import scala.collection.mutable.{Map => MMap, Set => MSet, Stack => MStack}
+import scala.language.existentials
+import scala.util.Try
 
-import com.esotericsoftware.reflectasm.shaded.org.objectweb.asm.{
-  ClassReader,
-  ClassVisitor,
-  MethodVisitor,
-  Type
-}
-import com.esotericsoftware.reflectasm.shaded.org.objectweb.asm.Opcodes._
-
-/**
- * Copied from Spark, written by Matei Zaharia (matei@cs.berkeley.edu).
- *
- * Ported to ASM 4.0 and refactored for scalding/summingbird by Oscar Boykin
- *
- * Original code: https://github.com/mesos/spark/blob/master/core/src/main/scala/spark/ClosureCleaner.scala
- */
 object ClosureCleaner {
-  val OUTER = "$outer"
+  private[this] val OUTER = "$outer"
 
-  // Here are the caches for the stuff that depends only on Class[_]
-  // TODO maybe these should be thread-local for thread safety
-  private val outerFields = MMap[Class[_], Option[Field]]()
-  private val outerClassHier = MMap[Class[_], List[Class[_]]]()
-  private val innerClasses = MMap[Class[_], Set[Class[_]]]()
-  private val accessedFieldsMap = MMap[Class[_], Set[Field]]()
-
-  private def getClassReader(cls: Class[_]): ClassReader = {
-    val className = cls.getName.replaceFirst("^.*\\.", "") + ".class"
-    new ClassReader(cls.getResourceAsStream(className))
+  /** Clean the closure in place. */
+  final def apply[T <: AnyRef](func: T): T = {
+    try {
+      val buffer = new ByteArrayOutputStream
+      val oos = new ObjectOutputStream(buffer)
+      try {
+        oos.writeObject(func.asInstanceOf[Serializable])
+      } finally {
+        if (oos != null) oos.close()
+      }
+      buffer.toByteArray
+    } catch {
+      case _ @(_: IOException | _: ClassCastException) =>
+        clean(func)
+    }
+    func
   }
 
-  // Return the $outer field for this class
+  private def clean(func: AnyRef): AnyRef =
+    new TransitiveClosureCleaner(func).clean
+
   def outerFieldOf(c: Class[_]): Option[Field] =
-    outerFields
-      .getOrElseUpdate(c, c.getDeclaredFields.find { _.getName == OUTER })
+    Try(c.getDeclaredField(OUTER)).toOption
+
+  def isOuterField(f: Field): Boolean = f.getName == OUTER
 
   /**
-   * this does reflection each time
-   * since Class objects are assumed to be immutable, we cache this result
+   * Returns the (Class, AnyRef) pairs from highest level to lowest level. The last element is the
+   * outer of the closure.
    */
-  @tailrec
-  private def getOuterClassesFn(cls: Class[_], hierarchy: List[Class[_]] = Nil): List[Class[_]] =
-    outerFieldOf(cls) match {
-      case None => hierarchy
-      case Some(f) => {
-        val next = f.getType
-        getOuterClassesFn(next, next :: hierarchy)
+  def outerClassesOf(obj: AnyRef): List[(Class[_], AnyRef)] = {
+    @tailrec
+    def loop(obj: AnyRef, hierarchy: List[(Class[_], AnyRef)]): List[(Class[_], AnyRef)] =
+      outerFieldOf(obj.getClass) match {
+        case None    => hierarchy // We have finished
+        case Some(f) =>
+          // f is the $outer of obj
+          f.setAccessible(true)
+          // myOuter = obj.$outer
+          val myOuter = f.get(obj)
+          val outerType = myOuter.getClass
+
+          loop(myOuter, (outerType, myOuter) :: hierarchy)
       }
-    }
 
-  def outerClassesOf(cls: Class[_]): List[Class[_]] =
-    outerClassHier.getOrElseUpdate(cls, getOuterClassesFn(cls))
+    loop(obj, Nil)
+  }
 
-  /**
-   * returns the (Class, AnyRef) pair from highest level to lowest level
-   * so result.last is the outer of obj.
-   */
-  @tailrec
-  def getOutersOf(obj: AnyRef, hierarchy: List[(Class[_], AnyRef)] = Nil): List[(Class[_], AnyRef)] =
-    outerFieldOf(obj.getClass) match {
-      case None => hierarchy // We have finished
-      case Some(f) => {
-        // f is the $outer of obj
-        f.setAccessible(true)
-        // myOuter = obj.$outer
-        val myOuter = f.get(obj)
-        // This is (Class[T], T) into the hierarchy:
-        // Note that if you use f.getType you might get an interface. No good
-        val outerType = myOuter.getClass
-        getOutersOf(myOuter, (outerType, myOuter) :: hierarchy)
-      }
-    }
-
-  private def getInnerClassesFn(inCls: Class[_]): Set[Class[_]] = {
-    val seen = MSet[Class[_]](inCls)
-    var stack = List[Class[_]](inCls)
-    while (!stack.isEmpty) {
-      val cr = getClassReader(stack.head)
-      stack = stack.tail
+  def innerClassesOf(func: AnyRef): Set[Class[_]] = {
+    val seen = MSet[Class[_]](func.getClass)
+    val stack = MStack[Class[_]](func.getClass)
+    while (stack.nonEmpty) {
+      val cr = AsmUtil.classReader(stack.pop())
       val set = MSet[Class[_]]()
-      cr.accept(new InnerClosureFinder(set), 0)
-      for (cls <- set -- seen) {
-        seen += cls
-        stack = cls :: stack
-      }
-    }
-    (seen - inCls).toSet
-  }
-
-  def innerClassesOf(cls: Class[_]): Set[Class[_]] =
-    innerClasses.getOrElseUpdate(cls, getInnerClassesFn(cls))
-
-  private def getAccessedFields(cls: Class[_]): MMap[Class[_], MSet[String]] = {
-    val af = outerClassesOf(cls)
-      .foldLeft(MMap[Class[_], MSet[String]]()) { (m, clazz) =>
-        m += ((clazz, MSet[String]()))
-      }
-
-    (innerClassesOf(cls) + cls).foreach { cls =>
-      getClassReader(cls).accept(new FieldAccessFinder(af), 0)
-    }
-    af
-  }
-
-  /**
-   * Uses ASM to return the names of the fields accessed by this cls
-   */
-  def accessedFieldsOf(cls: Class[_]): Set[Field] =
-    accessedFieldsMap.get(cls) match {
-      case Some(s) => s
-      case None => {
-        //Compute and store:
-        val af = getAccessedFields(cls)
-        def toF(ss: Set[String]): Set[Field] = ss.map { cls.getDeclaredField(_) }
-
-        val s = af.get(cls).map { _.toSet }.getOrElse(Set[String]())
-        // Add all of af:
-        af.foreach { clsMSet =>
-          val set = clsMSet._2.toSet
-          accessedFieldsMap += ((clsMSet._1, toF(set)))
+      cr.foreach { reader =>
+        reader.accept(new InnerClosureFinder(set), 0)
+        (set -- seen).foreach { cls =>
+          seen += cls
+          stack.push(cls)
         }
-        toF(s)
       }
     }
-
-  def apply(obj: AnyRef): Unit = {
-    val newCleanedOuter = allocCleanedOuter(obj)
-    // I know the cool kids use Options, but this code
-    // will avoid an allocation in the usual case of
-    // no $outer
-    setOuter(obj, newCleanedOuter)
+    (seen - func.getClass).toSet
   }
 
-  /**
-   * Return a new bottom-most $outer instance of this obj
-   * with only the accessed fields set in the $outer parent chain
-   */
-  private def allocCleanedOuter(in: AnyRef): AnyRef =
-    // Go top down filling in the actual accessed fields:
-    getOutersOf(in)
-    // the outer-most-outer is null:
-      .foldLeft(null: AnyRef) { (prevOuter, clsData) =>
-        val (thisOuterCls, realOuter) = clsData
-        // create a new outer class that does not have the constructor
-        // called on it.
-        val nextOuter = instantiateClass(thisOuterCls);
-        // We are populate its $outer variable with the
-        // previous outer, and then we go down, and set the accessed
-        // fields below:
-        setOuter(nextOuter, prevOuter)
-        // for each of the accessed fields of this class
-        // set the fields from the parents of in:
-        accessedFieldsOf(thisOuterCls)
-          .foreach { setFromTo(_, realOuter, nextOuter) }
-        // Now return this populated object for the next outer instance to use
-        nextOuter
-      }
+  def setOuter(obj: AnyRef, outer: AnyRef): Unit =
+    if (outer != null) {
+      val field = outerFieldOf(obj.getClass).get
+      field.setAccessible(true)
+      field.set(obj, outer)
+    }
 
-  // Set the given field in newv to the same value as old
-  private def setFromTo(f: Field, old: AnyRef, newv: AnyRef) {
+  def copyField(f: Field, old: AnyRef, newv: AnyRef): Unit = {
     f.setAccessible(true)
     val accessedValue = f.get(old)
     f.set(newv, accessedValue)
   }
 
-  private def setOuter(obj: AnyRef, outer: AnyRef) {
-    if (null != outer) {
-      val field = outerFieldOf(obj.getClass).get
-      field.setAccessible(true)
-      field.set(obj, outer)
-    }
-  }
+  def instantiateClass(cls: Class[_]): AnyRef = {
+    val objectCtor = classOf[_root_.java.lang.Object].getDeclaredConstructor()
 
-  private val objectCtor = classOf[_root_.java.lang.Object].getDeclaredConstructor();
-  // Use reflection to instantiate object without calling constructor
-  private def instantiateClass(cls: Class[_]): AnyRef =
     sun.reflect.ReflectionFactory.getReflectionFactory
       .newConstructorForSerialization(cls, objectCtor)
       .newInstance()
       .asInstanceOf[AnyRef]
+  }
 }
 
-class FieldAccessFinder(output: MMap[Class[_], MSet[String]]) extends ClassVisitor(ASM5) {
+sealed trait ClosureCleaner {
+  import ClosureCleaner._
+
+  /** The closure to clean. */
+  val func: AnyRef
+
+  /** Clean [[func]] by replacing its 'outer' with a cleaned clone. See [[cleanOuter()]]. */
+  def clean: AnyRef = {
+    val newOuter = cleanOuter()
+    setOuter(func, newOuter)
+    func
+  }
+
+  /**
+   * Create a new 'cleaned' copy of [[func]]'s outer, without modifying the original. The cleaned
+   * outer may have null values for fields that are determined to be unneeded in the context
+   * of [[func]].
+   *
+   * @return The cleaned outer.
+   */
+  def cleanOuter(): AnyRef
+}
+
+/**
+ * An implementation of [[ClosureCleaner]] that cleans [[func]] by transitively tracing its method
+ * calls and field references up through its enclosing scopes. A new hierarchy of outers is
+ * constructed by cloning the outer scopes and populating only the fields that are to be accessed
+ * by [[func]] (including any of its inner closures). Additionally, outers are removed from the
+ * new hierarchy if none of their fields are accessed by [[func]].
+ */
+private final class TransitiveClosureCleaner(val func: AnyRef) extends ClosureCleaner {
+  import ClosureCleaner._
+
+  private lazy val outerClasses: List[(Class[_], AnyRef)] = outerClassesOf(func)
+  private lazy val accessedFieldsMap: Map[Class[_], Set[Field]] = {
+    val accessedFields = outerClasses
+      .map(_._1)
+      .foldLeft(MMap[Class[_], MSet[String]]()) { (m, cls) =>
+        m += ((cls, MSet[String]()))
+      }
+
+    (innerClassesOf(func) + func.getClass)
+      .foreach {
+        AsmUtil.classReader(_).foreach { reader =>
+          reader.accept(new AccessedFieldsVisitor(accessedFields), 0)
+        }
+      }
+
+    accessedFields.map {
+      case (cls, mset) =>
+        def toF(ss: Set[String]): Set[Field] = ss.map(cls.getDeclaredField)
+        val set = mset.toSet
+        (cls, toF(set))
+    }.toMap
+  }
+
+  override def cleanOuter(): AnyRef =
+    outerClasses.foldLeft(null: AnyRef) { (prevOuter, clsData) =>
+      val (thisOuterCls, realOuter) = clsData
+      val nextOuter = instantiateClass(thisOuterCls)
+      accessedFieldsMap(thisOuterCls).foreach(
+        copyField(_, realOuter, nextOuter)
+      )
+      /* If this object's outer is not transitively referenced from the starting closure
+         (or any of its inner closures), we can null it out. */
+      val parent = if (!accessedFieldsMap(thisOuterCls).exists(isOuterField)) {
+        null
+      } else {
+        prevOuter
+      }
+      setOuter(nextOuter, parent)
+      nextOuter
+    }
+}
+
+private final case class MethodIdentifier[T](cls: Class[T], name: String, desc: String)
+
+private final class AccessedFieldsVisitor(
+    output: MMap[Class[_], MSet[String]],
+    specificMethod: Option[MethodIdentifier[_]] = None,
+    visitedMethods: MSet[MethodIdentifier[_]] = MSet.empty
+) extends ClassVisitor(ASM7) {
   override def visitMethod(
       access: Int,
       name: String,
@@ -225,25 +222,45 @@ class FieldAccessFinder(output: MMap[Class[_], MSet[String]]) extends ClassVisit
       sig: String,
       exceptions: Array[String]
   ): MethodVisitor =
-    return new MethodVisitor(ASM5) {
-      override def visitFieldInsn(op: Int, owner: String, name: String, desc: String) {
-        if (op == GETFIELD)
-          for (cl <- output.keys if cl.getName == owner.replace('/', '.'))
-            output(cl) += name
-      }
+    if (specificMethod.isDefined &&
+        (specificMethod.get.name != name || specificMethod.get.desc != desc)) {
+      null
+    } else {
+      new MethodVisitor(ASM7) {
+        override def visitFieldInsn(op: Int, owner: String, name: String, desc: String): Unit =
+          if (op == GETFIELD) {
+            for (cl <- output.keys if cl.getName == owner.replace('/', '.')) {
+              output(cl) += name
+            }
+          }
 
-      override def visitMethodInsn(op: Int, owner: String, name: String, desc: String, itf: Boolean) {
-        // Check for calls a getter method for a variable in an interpreter wrapper object.
-        // This means that the corresponding field will be accessed, so we should save it.
-        if (op == INVOKEVIRTUAL && owner.endsWith("$iwC") && !name.endsWith("$outer"))
-          for (cl <- output.keys if cl.getName == owner.replace('/', '.'))
-            output(cl) += name
+        override def visitMethodInsn(op: Int, owner: String, name: String, desc: String, itf: Boolean): Unit =
+          for (cl <- output.keys if cl.getName == owner.replace('/', '.')) {
+            // Check for calls a getter method for a variable in an interpreter wrapper object.
+            // This means that the corresponding field will be accessed, so we should save it.
+            if (op == INVOKEVIRTUAL && owner.endsWith("$iwC") && !name.endsWith(
+                  "$outer"
+                )) {
+              output(cl) += name
+            }
+            val m = MethodIdentifier(cl, name, desc)
+            if (!visitedMethods.contains(m)) {
+              // Keep track of visited methods to avoid potential infinite cycles
+              visitedMethods += m
+              AsmUtil.classReader(cl).foreach { reader =>
+                reader.accept(
+                  new AccessedFieldsVisitor(output, Some(m), visitedMethods),
+                  0
+                )
+              }
+            }
+          }
       }
     }
 }
 
-class InnerClosureFinder(output: MSet[Class[_]]) extends ClassVisitor(ASM5) {
-  var myName: String = null
+private final class InnerClosureFinder(output: MSet[Class[_]]) extends ClassVisitor(ASM7) {
+  private[this] var myName: String = _
 
   override def visit(
       version: Int,
@@ -252,9 +269,8 @@ class InnerClosureFinder(output: MSet[Class[_]]) extends ClassVisitor(ASM5) {
       sig: String,
       superName: String,
       interfaces: Array[String]
-  ) {
+  ): Unit =
     myName = name
-  }
 
   override def visitMethod(
       access: Int,
@@ -263,13 +279,25 @@ class InnerClosureFinder(output: MSet[Class[_]]) extends ClassVisitor(ASM5) {
       sig: String,
       exceptions: Array[String]
   ): MethodVisitor =
-    return new MethodVisitor(ASM5) {
-      override def visitMethodInsn(op: Int, owner: String, name: String, desc: String, itf: Boolean) {
+    new MethodVisitor(ASM7) {
+      override def visitMethodInsn(op: Int, owner: String, name: String, desc: String, itf: Boolean): Unit = {
         val argTypes = Type.getArgumentTypes(desc)
-        if (op == INVOKESPECIAL && name == "<init>" && argTypes.length > 0
-            && argTypes(0).toString.startsWith("L") // is it an object?
-            && argTypes(0).getInternalName == myName)
-          output += Class.forName(owner.replace('/', '.'), false, Thread.currentThread.getContextClassLoader)
+        if (op == INVOKESPECIAL && name == "<init>" && argTypes.nonEmpty
+            && argTypes(0).toString.startsWith("L")
+            && argTypes(0).getInternalName == myName) {
+          output += Class.forName(
+            owner.replace('/', '.'),
+            false,
+            Thread.currentThread.getContextClassLoader
+          )
+        }
       }
     }
+}
+
+private object AsmUtil {
+  def classReader(cls: Class[_]): Option[ClassReader] = {
+    val className = cls.getName.replaceFirst("^.*\\.", "") + ".class"
+    Try(new ClassReader(cls.getResourceAsStream(className))).toOption
+  }
 }
