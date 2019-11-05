@@ -22,16 +22,18 @@ import _root_.java.io.{ByteArrayOutputStream, ObjectOutputStream}
 import scala.util.Try
 
 class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
-  def debug(x: AnyRef) {
+  private def debug(x: AnyRef) {
     println(x.getClass)
     println(x.getClass.getDeclaredFields.map { _.toString }.mkString("  "))
   }
+
   "ClosureCleaner" should {
     "clean normal objects" in {
       val myList = List(1, 2, 3)
       ClosureCleaner(myList)
       myList should equal(List(1, 2, 3))
     }
+
     "clean actual closures" in {
       val myFun = { x: Int =>
         x * 2
@@ -58,11 +60,13 @@ class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
       ClosureCleaner(fn)
       fn("hey") should equal(20)
     }
+
     "Handle functions in traits" in {
       val fn = BaseFns2.timesByMult
       ClosureCleaner(fn)
       fn(10) should equal(50)
     }
+
     "Handle captured vals" in {
       val answer = 42
       val fn = { x: Int =>
@@ -73,13 +77,15 @@ class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
     }
 
     "Handle nested closures in non-serializable object" in {
-      val fn = new NestedClosuresNotSerializable().getMapFn
-      isSerializable(fn) shouldBe false
+      val fn: Int => Int = new NestedClosuresNotSerializable().getMapFn
+
       ClosureCleaner(fn)
       isSerializable(fn) shouldBe true
       fn(6) shouldEqual 8
-      val roundTripFn = jrt(fn.asInstanceOf[Serializable]).asInstanceOf[Int => Int]
-      roundTripFn(6) shouldEqual 8
+
+      val serialized = jserialize(fn.asInstanceOf[Serializable])
+      val deserialized = jdeserialize[Int => Int](serialized)
+      deserialized(6) shouldEqual 8
     }
   }
 
@@ -97,8 +103,5 @@ class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
   }
 
   private def isSerializable(obj: AnyRef): Boolean =
-    Try(
-      new ObjectOutputStream(new ByteArrayOutputStream())
-        .writeObject(obj)
-    ).isSuccess
+    Try(new ObjectOutputStream(new ByteArrayOutputStream()).writeObject(obj)).isSuccess
 }
