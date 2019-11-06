@@ -33,6 +33,7 @@ import _root_.java.io.IOException
 import _root_.java.lang.reflect.Field
 import _root_.java.io.ByteArrayOutputStream
 import _root_.java.io.ObjectOutputStream
+import _root_.java.lang.invoke.SerializedLambda
 
 import org.apache.xbean.asm7.Opcodes._
 import org.apache.xbean.asm7.{ClassReader, ClassVisitor, MethodVisitor, Type}
@@ -58,13 +59,36 @@ object ClosureCleaner {
       buffer.toByteArray
     } catch {
       case _ @(_: IOException | _: ClassCastException) =>
-        clean(func)
+        new TransitiveClosureCleaner(func).clean()
     }
     func
   }
 
-  private def clean(func: AnyRef): AnyRef =
-    new TransitiveClosureCleaner(func).clean
+  def isClosure(cls: Class[_]): Boolean =
+    cls.getName.contains("$anonfun$")
+
+  private def serializedLambda(closure: AnyRef): Option[SerializedLambda] = {
+    val isClosureCandidate =
+      closure.getClass.isSynthetic &&
+        closure.getClass.getInterfaces.exists(_.getName == "scala.Serializable")
+
+    if (isClosureCandidate) {
+      try {
+        Option(inspect(closure))
+      } catch {
+        case e: Exception =>
+          None
+      }
+    } else {
+      None
+    }
+  }
+
+  def inspect(closure: AnyRef): SerializedLambda = {
+    val writeReplace = closure.getClass.getDeclaredMethod("writeReplace")
+    writeReplace.setAccessible(true)
+    writeReplace.invoke(closure).asInstanceOf[SerializedLambda]
+  }
 
   def outerFieldOf(c: Class[_]): Option[Field] =
     Try(c.getDeclaredField(OUTER)).toOption
@@ -139,9 +163,9 @@ sealed trait ClosureCleaner {
   /** The closure to clean. */
   val func: AnyRef
 
-  /** Clean [[func]] by replacing its 'outer' with a cleaned clone. See [[cleanOuter()]]. */
-  def clean: AnyRef = {
-    val newOuter = cleanOuter()
+  /** Clean [[func]] by replacing its 'outer' with a cleaned clone. See [[cleanOuter]]. */
+  def clean(): AnyRef = {
+    val newOuter = cleanOuter
     setOuter(func, newOuter)
     func
   }
@@ -153,7 +177,7 @@ sealed trait ClosureCleaner {
    *
    * @return The cleaned outer.
    */
-  def cleanOuter(): AnyRef
+  def cleanOuter: AnyRef
 }
 
 /**
@@ -166,8 +190,8 @@ sealed trait ClosureCleaner {
 private final class TransitiveClosureCleaner(val func: AnyRef) extends ClosureCleaner {
   import ClosureCleaner._
 
-  private lazy val outerClasses: List[(Class[_], AnyRef)] = outerClassesOf(func)
-  private lazy val accessedFieldsMap: Map[Class[_], Set[Field]] = {
+  private[this] val outerClasses: List[(Class[_], AnyRef)] = outerClassesOf(func)
+  private[this] val accessedFieldsMap: Map[Class[_], Set[Field]] = {
     val accessedFields = outerClasses
       .map(_._1)
       .foldLeft(MMap[Class[_], MSet[String]]()) { (m, cls) =>
@@ -181,7 +205,7 @@ private final class TransitiveClosureCleaner(val func: AnyRef) extends ClosureCl
         }
       }
 
-    accessedFields.map {
+    accessedFields.iterator.map {
       case (cls, mset) =>
         def toF(ss: Set[String]): Set[Field] = ss.map(cls.getDeclaredField)
         val set = mset.toSet
@@ -189,7 +213,7 @@ private final class TransitiveClosureCleaner(val func: AnyRef) extends ClosureCl
     }.toMap
   }
 
-  override def cleanOuter(): AnyRef =
+  override def cleanOuter: AnyRef =
     outerClasses.foldLeft(null: AnyRef) { (prevOuter, clsData) =>
       val (thisOuterCls, realOuter) = clsData
       val nextOuter = instantiateClass(thisOuterCls)
@@ -229,13 +253,21 @@ private final class AccessedFieldsVisitor(
       new MethodVisitor(ASM7) {
         override def visitFieldInsn(op: Int, owner: String, name: String, desc: String): Unit =
           if (op == GETFIELD) {
-            for (cl <- output.keys if cl.getName == owner.replace('/', '.')) {
-              output(cl) += name
-            }
+            val ownerName = owner.replace('/', '.')
+            output.keys.iterator
+              .filter(_.getName == ownerName)
+              .foreach(cl => output(cl) += name)
           }
 
-        override def visitMethodInsn(op: Int, owner: String, name: String, desc: String, itf: Boolean): Unit =
-          for (cl <- output.keys if cl.getName == owner.replace('/', '.')) {
+        override def visitMethodInsn(
+            op: Int,
+            owner: String,
+            name: String,
+            desc: String,
+            itf: Boolean
+        ): Unit = {
+          val ownerName = owner.replace('/', '.')
+          output.keys.iterator.filter(_.getName == ownerName).foreach { cl =>
             // Check for calls a getter method for a variable in an interpreter wrapper object.
             // This means that the corresponding field will be accessed, so we should save it.
             if (op == INVOKEVIRTUAL && owner.endsWith("$iwC") && !name.endsWith(
@@ -255,6 +287,7 @@ private final class AccessedFieldsVisitor(
               }
             }
           }
+        }
       }
     }
 }

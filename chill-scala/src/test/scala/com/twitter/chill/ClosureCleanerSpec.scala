@@ -18,8 +18,24 @@ package com.twitter.chill
 
 import org.scalatest._
 
-import _root_.java.io.{ByteArrayOutputStream, ObjectOutputStream}
+import org.scalacheck.Arbitrary
+import org.scalatestplus.scalacheck.ScalaCheckDrivenPropertyChecks._
+
+import scala.reflect.ClassTag
 import scala.util.Try
+
+class NestedClosuresNotSerializable {
+  val irrelevantInt: Int = 1
+  def closure(name: String)(body: => Int => Int): Int => Int = body
+  def getMapFn: Int => Int = closure("one") {
+    def x = irrelevantInt
+    def y = 2
+    val fn = { a: Int =>
+      a + y
+    }
+    fn
+  }
+}
 
 class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
   private def debug(x: AnyRef) {
@@ -27,81 +43,74 @@ class ClosureCleanerSpec extends WordSpec with Matchers with BaseProperties {
     println(x.getClass.getDeclaredFields.map { _.toString }.mkString("  "))
   }
 
+  private val someSerializableValue = 1
+  private def someSerializableMethod() = 1
+
   "ClosureCleaner" should {
-    "clean normal objects" in {
-      val myList = List(1, 2, 3)
-      ClosureCleaner(myList)
-      myList should equal(List(1, 2, 3))
+    "clean basic closures" in {
+      assume(!ClosureCleanerSpec.supportsLMFs)
+      val closure1 = (x: Int) => someSerializableValue
+      val closure2 = (x: Int) => someSerializableMethod()
+
+      law(closure1)
+      law(closure2)
     }
 
-    "clean actual closures" in {
-      val myFun = { x: Int =>
-        x * 2
+    "clean basic nested closures" in {
+      assume(!ClosureCleanerSpec.supportsLMFs)
+      val closure1 = (i: Int) => {
+        Option(i).map { x =>
+          x + someSerializableValue
+        }
+      }
+      val closure2 = (j: Int) => {
+        Option(j).map { x =>
+          x + someSerializableMethod()
+        }
+      }
+      val closure3 = (m: Int) => {
+        Option(m).foreach { x =>
+          Option(x).foreach { y =>
+            Option(y).foreach { z =>
+              someSerializableValue
+            }
+          }
+        }
       }
 
-      ClosureCleaner(myFun)
-      myFun(1) should equal(2)
-      myFun(2) should equal(4)
-
-      case class Test(x: Int)
-      val t = Test(3)
-      ClosureCleaner(t)
-      t should equal(Test(3))
+      law(closure1)
+      law(closure2)
+      law(closure3)
     }
 
-    "handle outers with constructors" in {
-      class Test(x: String) {
-        val l = x.size
-        def rev(y: String) = (x + y).size
-      }
+    "clean complex nested closures" in {
+      assume(!ClosureCleanerSpec.supportsLMFs)
 
-      val t = new Test("you all everybody")
-      val fn = t.rev _
-      ClosureCleaner(fn)
-      fn("hey") should equal(20)
-    }
+      law(new NestedClosuresNotSerializable().getMapFn)
 
-    "Handle functions in traits" in {
-      val fn = BaseFns2.timesByMult
-      ClosureCleaner(fn)
-      fn(10) should equal(50)
-    }
+      class A1(val f: Int => Int)
+      class A2(val f: Int => Int)
+      class B extends A1(x => x * x)
+      class C extends A2(x => new B().f(x))
 
-    "Handle captured vals" in {
-      val answer = 42
-      val fn = { x: Int =>
-        answer * x
-      }
-      ClosureCleaner(fn)
-      fn(10) should equal(420)
-    }
-
-    "Handle nested closures in non-serializable object" in {
-      val fn: Int => Int = new NestedClosuresNotSerializable().getMapFn
-
-      ClosureCleaner(fn)
-      isSerializable(fn) shouldBe true
-      fn(6) shouldEqual 8
-
-      val serialized = jserialize(fn.asInstanceOf[Serializable])
-      val deserialized = jdeserialize[Int => Int](serialized)
-      deserialized(6) shouldEqual 8
+      law(new C().f)
     }
   }
 
-  class NestedClosuresNotSerializable {
-    val irrelevantInt: Int = 1
-    def closure(name: String)(body: => Int => Int): Int => Int = body
-    def getMapFn: Int => Int = closure("one") {
-      def x = irrelevantInt
-      def y = 2
-      val fn = { a: Int =>
-        a + y
-      }
-      fn
+  private def isSerializable[T: ClassTag](obj: T): Boolean =
+    Try(jdeserialize[T](jserialize(obj.asInstanceOf[Serializable]))).isSuccess
+
+  def law[A: Arbitrary, B](fn: => A => B): Assertion = {
+    val fn0 = fn
+    assert(!isSerializable(fn0))
+    val clean = ClosureCleaner(fn)
+    assert(isSerializable(clean))
+    forAll { a: A =>
+      assert(clean(a) == fn0(a))
     }
   }
+}
 
-  private def isSerializable(obj: AnyRef): Boolean =
-    Try(new ObjectOutputStream(new ByteArrayOutputStream()).writeObject(obj)).isSuccess
+object ClosureCleanerSpec {
+  val supportsLMFs: Boolean = scala.util.Properties.versionString.contains("2.12")
 }
